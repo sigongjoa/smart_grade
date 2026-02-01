@@ -2,24 +2,41 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import os
-import shutil
 import uuid
 import cv2
-import numpy as np
-import traceback
+import logging
+import aiofiles
+from typing import Optional
 from engine.document_processor import DocumentProcessor
 from engine.bubble_detector import BubbleDetector
 from engine.ocr_engine import OCREngine
+
 os.environ["DISABLE_MODEL_SOURCE_CHECK"] = "True"
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Smart-Grader API")
 
-# Configure CORS
+# Configuration
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/bmp", "image/tiff", "image/webp"}
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+
+# SS-03 OMR Format Configuration
+SS03_QUESTION_COLUMN_X_OFFSET = 300  # X coordinate threshold for question columns (skip ID columns)
+SS03_COLUMN_THRESHOLD = 60  # Pixel threshold for grouping bubbles into columns
+SS03_NUM_QUESTION_COLUMNS = 4  # Number of question columns in SS-03 format
+SS03_QUESTIONS_PER_COLUMN = 10  # Questions per column
+
+# Configure CORS with specific origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 UPLOAD_DIR = "uploads"
@@ -30,22 +47,67 @@ os.makedirs(PROCESSED_DIR, exist_ok=True)
 # Mount static files to serve processed images
 app.mount("/processed", StaticFiles(directory=PROCESSED_DIR), name="processed")
 
-# Initialize engines
+# Initialize engines (OCR is lazy-loaded for faster startup)
 doc_processor = DocumentProcessor()
 bubble_detector = BubbleDetector()
-ocr_engine = OCREngine()
+_ocr_engine: Optional[OCREngine] = None
+
+
+def get_ocr_engine() -> OCREngine:
+    """Lazy initialization of OCR engine to improve startup time."""
+    global _ocr_engine
+    if _ocr_engine is None:
+        logger.info("Initializing OCR engine (first use)...")
+        _ocr_engine = OCREngine()
+    return _ocr_engine
+
+
+def validate_file(file: UploadFile) -> None:
+    """Validate uploaded file type and size."""
+    # Check file extension
+    if file.filename:
+        ext = os.path.splitext(file.filename)[1].lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+            )
+
+    # Check MIME type
+    if file.content_type and file.content_type not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file type. Please upload an image file."
+        )
 
 @app.post("/api/grade")
 async def grade_omr(file: UploadFile = File(...)):
     """
     Upload an OMR scan and get grading results.
     """
+    # Validate file type
+    validate_file(file)
+
+    # Use only UUID for filename to prevent path traversal attacks
     file_id = str(uuid.uuid4())
-    input_path = os.path.join(UPLOAD_DIR, f"{file_id}_{file.filename}")
-    
-    with open(input_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-        
+    ext = os.path.splitext(file.filename or ".jpg")[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        ext = ".jpg"
+    input_path = os.path.join(UPLOAD_DIR, f"{file_id}{ext}")
+
+    # Async file write for better performance
+    try:
+        content = await file.read()
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail="File too large. Maximum size is 10MB.")
+        async with aiofiles.open(input_path, "wb") as buffer:
+            await buffer.write(content)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"File upload error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save uploaded file.")
+
     try:
         # 1. Processing (Alignment)
         warped = doc_processor.process_document(input_path)
@@ -69,23 +131,31 @@ async def grade_omr(file: UploadFile = File(...)):
         
         # Multi-column mapping logic for SS-03
         # 1. Sort by X to find columns
-        columns = bubble_detector.detect_columns(bubbles, col_threshold=60)
-        
+        columns = bubble_detector.detect_columns(bubbles, col_threshold=SS03_COLUMN_THRESHOLD)
+
         grading_results = {}
         # Filter out the first few columns if they are part of Class/ID info
-        # For SS-03, typically columns starting from X > 300 are questions
-        question_columns = [col for col in columns if col[0][0] > 300]
-        
-        # Process each question column (Expected 4 columns of 10 questions)
-        for col_idx, col_bubbles in enumerate(question_columns[:4]):
+        # For SS-03, columns starting from X > threshold are questions
+        question_columns = [
+            col for col in columns if col[0][0] > SS03_QUESTION_COLUMN_X_OFFSET
+        ]
+
+        # Process each question column
+        for col_idx, col_bubbles in enumerate(question_columns[:SS03_NUM_QUESTION_COLUMNS]):
             grid_rows = bubble_detector.sort_into_grid(col_bubbles)
             for row_idx, row in enumerate(grid_rows):
-                q_num = col_idx * 10 + row_idx + 1
+                q_num = col_idx * SS03_QUESTIONS_PER_COLUMN + row_idx + 1
                 marking_status = bubble_detector.check_marking(warped, row)
-                marked_indices = [idx for idx, r in enumerate(marking_status) if r["is_marked"]]
-                grading_results[q_num] = {"selected": marked_indices, "confidence": [r["score"] for r in marking_status]}
+                marked_indices = [
+                    idx for idx, r in enumerate(marking_status) if r["is_marked"]
+                ]
+                grading_results[q_num] = {
+                    "selected": marked_indices,
+                    "confidence": [r["score"] for r in marking_status]
+                }
         
-        # 3. Handwriting OCR (optional for name)
+        # 3. Handwriting OCR (optional for name) - lazy loaded
+        ocr_engine = get_ocr_engine()
         text_results = ocr_engine.extract_text(warped)
         
         # Improved name extraction logic
@@ -102,6 +172,9 @@ async def grade_omr(file: UploadFile = File(...)):
                     student_name = all_texts[i+1]
                 break
         
+        # Clear grayscale cache to free memory
+        bubble_detector.clear_cache()
+
         # 4. Final aggregation
         response = {
             "id": file_id,
@@ -111,12 +184,21 @@ async def grade_omr(file: UploadFile = File(...)):
             "student_name": student_name,
             "message": "Grading complete."
         }
-        
+
         return response
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"Grading error for file {file_id}: {e}")
+        raise HTTPException(status_code=500, detail="An error occurred during grading. Please try again.")
+    finally:
+        # Clean up uploaded file to prevent disk space accumulation
+        if os.path.exists(input_path):
+            try:
+                os.remove(input_path)
+            except OSError as e:
+                logger.warning(f"Failed to clean up file {input_path}: {e}")
 
 @app.get("/")
 async def root():
