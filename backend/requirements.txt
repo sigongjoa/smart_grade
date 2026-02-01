@@ -9,3 +9,5 @@ openai
 pydantic
 python-dotenv
 aiofiles
+PyMuPDF
+pdf2image

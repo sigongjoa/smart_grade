@@ -6,10 +6,13 @@ import uuid
 import cv2
 import logging
 import aiofiles
-from typing import Optional
+from typing import List, Optional
 from engine.document_processor import DocumentProcessor
 from engine.bubble_detector import BubbleDetector
 from engine.ocr_engine import OCREngine
+from engine.pdf_answer_extractor import PDFAnswerExtractor
+from engine.omr_grid_detector import OMRGridDetector
+from engine.batch_grader import BatchGrader
 
 os.environ["DISABLE_MODEL_SOURCE_CHECK"] = "True"
 
@@ -21,9 +24,16 @@ app = FastAPI(title="Smart-Grader API")
 
 # Configuration
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
-ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
-ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/bmp", "image/tiff", "image/webp"}
+ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+ALLOWED_IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/bmp", "image/tiff", "image/webp"}
+ALLOWED_PDF_EXTENSIONS = {".pdf"}
+ALLOWED_PDF_MIME_TYPES = {"application/pdf"}
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+MAX_PDF_SIZE = 50 * 1024 * 1024  # 50MB for PDFs
+
+# Combined allowed extensions for backward compatibility
+ALLOWED_EXTENSIONS = ALLOWED_IMAGE_EXTENSIONS
+ALLOWED_MIME_TYPES = ALLOWED_IMAGE_MIME_TYPES
 
 # SS-03 OMR Format Configuration
 SS03_QUESTION_COLUMN_X_OFFSET = 300  # X coordinate threshold for question columns (skip ID columns)
@@ -47,10 +57,13 @@ os.makedirs(PROCESSED_DIR, exist_ok=True)
 # Mount static files to serve processed images
 app.mount("/processed", StaticFiles(directory=PROCESSED_DIR), name="processed")
 
-# Initialize engines (OCR is lazy-loaded for faster startup)
+# Initialize engines (OCR-dependent engines are lazy-loaded for faster startup)
 doc_processor = DocumentProcessor()
 bubble_detector = BubbleDetector()
+batch_grader = BatchGrader()
 _ocr_engine: Optional[OCREngine] = None
+_pdf_extractor: Optional[PDFAnswerExtractor] = None
+_grid_detector: Optional[OMRGridDetector] = None
 
 
 def get_ocr_engine() -> OCREngine:
@@ -62,22 +75,60 @@ def get_ocr_engine() -> OCREngine:
     return _ocr_engine
 
 
+def get_pdf_extractor() -> PDFAnswerExtractor:
+    """Lazy initialization of PDF answer extractor."""
+    global _pdf_extractor
+    if _pdf_extractor is None:
+        logger.info("Initializing PDF answer extractor...")
+        _pdf_extractor = PDFAnswerExtractor(ocr_engine=get_ocr_engine())
+    return _pdf_extractor
+
+
+def get_grid_detector() -> OMRGridDetector:
+    """Lazy initialization of grid detector."""
+    global _grid_detector
+    if _grid_detector is None:
+        logger.info("Initializing OMR grid detector...")
+        _grid_detector = OMRGridDetector(
+            bubble_detector=bubble_detector,
+            ocr_engine=get_ocr_engine()
+        )
+    return _grid_detector
+
+
 def validate_file(file: UploadFile) -> None:
-    """Validate uploaded file type and size."""
+    """Validate uploaded image file type and size."""
     # Check file extension
     if file.filename:
         ext = os.path.splitext(file.filename)[1].lower()
-        if ext not in ALLOWED_EXTENSIONS:
+        if ext not in ALLOWED_IMAGE_EXTENSIONS:
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+                detail=f"Invalid file type. Allowed: {', '.join(ALLOWED_IMAGE_EXTENSIONS)}"
             )
 
     # Check MIME type
-    if file.content_type and file.content_type not in ALLOWED_MIME_TYPES:
+    if file.content_type and file.content_type not in ALLOWED_IMAGE_MIME_TYPES:
         raise HTTPException(
             status_code=400,
             detail="Invalid file type. Please upload an image file."
+        )
+
+
+def validate_pdf_file(file: UploadFile) -> None:
+    """Validate uploaded PDF file."""
+    if file.filename:
+        ext = os.path.splitext(file.filename)[1].lower()
+        if ext not in ALLOWED_PDF_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid file type. Please upload a PDF file."
+            )
+
+    if file.content_type and file.content_type not in ALLOWED_PDF_MIME_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file type. Please upload a PDF file."
         )
 
 @app.post("/api/grade")
@@ -199,6 +250,146 @@ async def grade_omr(file: UploadFile = File(...)):
                 os.remove(input_path)
             except OSError as e:
                 logger.warning(f"Failed to clean up file {input_path}: {e}")
+
+@app.post("/api/batch-grade")
+async def batch_grade_omr(
+    answer_pdf: UploadFile = File(..., description="PDF file containing answer key"),
+    omr_image: UploadFile = File(..., description="Image with multiple OMR cards in grid layout")
+):
+    """
+    Batch grade multiple OMR cards against an answer key from PDF.
+
+    - Upload a PDF containing the exam with answer key
+    - Upload an image containing multiple OMR cards in grid layout
+    - Returns grading results for all detected students
+    """
+    # Validate files
+    validate_pdf_file(answer_pdf)
+    validate_file(omr_image)
+
+    batch_id = str(uuid.uuid4())
+    pdf_path = os.path.join(UPLOAD_DIR, f"{batch_id}_answers.pdf")
+    omr_path = os.path.join(UPLOAD_DIR, f"{batch_id}_omr.jpg")
+
+    try:
+        # Save PDF file
+        pdf_content = await answer_pdf.read()
+        if len(pdf_content) > MAX_PDF_SIZE:
+            raise HTTPException(status_code=400, detail="PDF file too large. Maximum size is 50MB.")
+        async with aiofiles.open(pdf_path, "wb") as f:
+            await f.write(pdf_content)
+
+        # Save OMR image
+        omr_content = await omr_image.read()
+        if len(omr_content) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail="Image file too large. Maximum size is 10MB.")
+        async with aiofiles.open(omr_path, "wb") as f:
+            await f.write(omr_content)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"File upload error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save uploaded files.")
+
+    try:
+        # 1. Extract answer key from PDF
+        logger.info(f"Extracting answers from PDF: {batch_id}")
+        pdf_extractor = get_pdf_extractor()
+        answer_result = pdf_extractor.extract_from_pdf_path(pdf_path)
+
+        if not answer_result["answers"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not extract answer key from PDF. Please check the PDF format."
+            )
+
+        answer_key = answer_result["answers"]
+        total_questions = len(answer_key)
+        logger.info(f"Extracted {total_questions} answers from PDF")
+
+        # 2. Load and process OMR grid image
+        logger.info(f"Processing OMR grid image: {batch_id}")
+        omr_image_data = cv2.imread(omr_path)
+        if omr_image_data is None:
+            raise HTTPException(status_code=400, detail="Could not read OMR image.")
+
+        # 3. Detect and grade individual OMR cards
+        grid_detector = get_grid_detector()
+        card_results = grid_detector.process_grid_image(
+            omr_image_data,
+            col_threshold=SS03_COLUMN_THRESHOLD,
+            question_x_offset=SS03_QUESTION_COLUMN_X_OFFSET,
+            num_question_columns=SS03_NUM_QUESTION_COLUMNS,
+            questions_per_column=SS03_QUESTIONS_PER_COLUMN
+        )
+
+        logger.info(f"Detected {len(card_results)} OMR cards")
+
+        # 4. Prepare student data for batch grading
+        student_data = []
+        for card in card_results:
+            student_data.append({
+                "name": card.student_name,
+                "answers": card.answers
+            })
+
+        # 5. Grade all students
+        grading_result = batch_grader.grade_batch(answer_key, student_data)
+
+        # 6. Save processed images for visualization
+        processed_images = []
+        for idx, card in enumerate(card_results):
+            card_path = os.path.join(PROCESSED_DIR, f"card_{batch_id}_{idx}.jpg")
+            cv2.imwrite(card_path, card.image)
+            processed_images.append(f"/processed/card_{batch_id}_{idx}.jpg")
+
+        # 7. Build response
+        students_response = []
+        for student in grading_result.students:
+            students_response.append({
+                "index": student.student_index,
+                "name": student.student_name,
+                "score": student.score_display,
+                "percentage": round(student.score, 1),
+                "correct_count": student.correct_count,
+                "total_questions": student.total_questions,
+                "details": student.details,
+                "image_url": processed_images[student.student_index] if student.student_index < len(processed_images) else None
+            })
+
+        response = {
+            "batch_id": batch_id,
+            "answer_key": answer_key,
+            "total_questions": total_questions,
+            "students": students_response,
+            "statistics": grading_result.statistics,
+            "pdf_extraction": {
+                "confidence": answer_result.get("confidence", 0),
+                "raw_text_preview": answer_result.get("raw_text", "")[:500]
+            },
+            "message": f"Batch grading complete. Graded {len(card_results)} students."
+        }
+
+        return response
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Batch grading error for {batch_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred during batch grading. Please try again."
+        )
+    finally:
+        # Clean up uploaded files
+        for path in [pdf_path, omr_path]:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError as e:
+                    logger.warning(f"Failed to clean up file {path}: {e}")
+
 
 @app.get("/")
 async def root():
