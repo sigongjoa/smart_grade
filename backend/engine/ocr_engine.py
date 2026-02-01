@@ -20,12 +20,20 @@ class OCREngine:
         Initialize PaddleOCR with specified settings.
 
         Args:
-            use_gpu: Whether to use GPU acceleration.
+            use_gpu: Whether to use GPU acceleration (may not be supported in newer versions).
             lang: Language code ('ko' for Korean, 'en' for English).
         """
         self.ocr: Optional[Any] = None
         if PaddleOCR:
-            self.ocr = PaddleOCR(use_angle_cls=True, lang=lang, use_gpu=use_gpu)
+            try:
+                # Try with use_gpu for older versions
+                self.ocr = PaddleOCR(use_angle_cls=True, lang=lang, use_gpu=use_gpu)
+            except (TypeError, ValueError):
+                # Newer versions don't support use_gpu parameter
+                try:
+                    self.ocr = PaddleOCR(use_angle_cls=True, lang=lang)
+                except Exception as e:
+                    logger.warning(f"Failed to initialize PaddleOCR: {e}")
         else:
             logger.warning("PaddleOCR not installed. OCR functionality will be limited.")
 

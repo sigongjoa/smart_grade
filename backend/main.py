@@ -324,6 +324,59 @@ async def batch_grade_omr(
             questions_per_column=SS03_QUESTIONS_PER_COLUMN
         )
 
+        # If no cards detected in grid, treat the entire image as a single OMR card
+        if not card_results:
+            logger.info("No grid detected, processing as single OMR card")
+            from engine.omr_grid_detector import OMRCardResult
+
+            # Process as single card using existing single-grade logic
+            warped = doc_processor.process_document(omr_path)
+            if warped is None:
+                warped = omr_image_data
+
+            bubbles = bubble_detector.detect_bubbles(warped)
+            columns = bubble_detector.detect_columns(bubbles, col_threshold=SS03_COLUMN_THRESHOLD)
+            question_columns = [
+                col for col in columns if col and col[0][0] > SS03_QUESTION_COLUMN_X_OFFSET
+            ]
+
+            answers = {}
+            confidence_scores = {}
+            for col_idx, col_bubbles in enumerate(question_columns[:SS03_NUM_QUESTION_COLUMNS]):
+                grid_rows = bubble_detector.sort_into_grid(col_bubbles)
+                for row_idx, row in enumerate(grid_rows):
+                    q_num = col_idx * SS03_QUESTIONS_PER_COLUMN + row_idx + 1
+                    marking_status = bubble_detector.check_marking(warped, row)
+                    marked_indices = [
+                        idx + 1 for idx, r in enumerate(marking_status) if r["is_marked"]
+                    ]
+                    answers[q_num] = marked_indices
+                    confidence_scores[q_num] = [r["score"] for r in marking_status]
+
+            # Extract student name
+            ocr_engine = get_ocr_engine()
+            text_results = ocr_engine.extract_text(warped)
+            student_name = "Unknown"
+            all_texts = [res["text"] for res in text_results]
+            for i, text in enumerate(all_texts):
+                if "이름" in text or "성명" in text:
+                    if ":" in text and len(text.split(":")[1].strip()) > 0:
+                        student_name = text.split(":")[1].strip()
+                    elif i + 1 < len(all_texts):
+                        student_name = all_texts[i + 1]
+                    break
+
+            bubble_detector.clear_cache()
+
+            card_results = [OMRCardResult(
+                card_index=0,
+                image=warped,
+                bbox=(0, 0, warped.shape[1], warped.shape[0]),
+                student_name=student_name,
+                answers=answers,
+                confidence_scores=confidence_scores
+            )]
+
         logger.info(f"Detected {len(card_results)} OMR cards")
 
         # 4. Prepare student data for batch grading
