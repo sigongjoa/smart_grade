@@ -34,3 +34,4 @@ backend/backend.log
 frontend/frontend.log
 .DS_Store
 .env
+.env

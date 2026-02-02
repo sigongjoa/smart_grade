@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import os
@@ -447,6 +447,79 @@ async def batch_grade_omr(
 @app.get("/")
 async def root():
     return {"message": "Smart-Grader API is running."}
+
+
+# Notion Integration Endpoints
+from notion_integration import get_notion_integration, NotionIntegration
+
+@app.post("/api/notion/upload")
+async def upload_to_notion(
+    batch_id: str = Form(..., description="Batch ID from grading"),
+    students_json: str = Form(..., description="JSON array of student results"),
+    subject: str = Form(None, description="Subject name (optional)"),
+    exam_date: str = Form(None, description="Exam date YYYY-MM (optional)")
+):
+    """
+    Upload grading results to Notion database.
+
+    - batch_id: The batch ID from batch grading
+    - students_json: JSON string containing array of student results
+    - subject: Optional subject name
+    - exam_date: Optional exam date in YYYY-MM format
+    """
+    try:
+        import json
+        students = json.loads(students_json)
+
+        if not students:
+            raise HTTPException(status_code=400, detail="No student data provided")
+
+        # Calculate average score for difficulty inference
+        avg_score = sum(s.get("percentage", 0) for s in students) / len(students)
+
+        notion = get_notion_integration()
+        result = notion.upload_grading_results(
+            batch_id=batch_id,
+            students=students,
+            subject=subject,
+            exam_date=exam_date,
+            average_score=avg_score
+        )
+
+        return {
+            "success": True,
+            "uploaded": len(result["success"]),
+            "failed": len(result["failed"]),
+            "total": result["total"],
+            "details": result
+        }
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON in students_json")
+    except Exception as e:
+        logger.exception(f"Notion upload error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to upload to Notion: {str(e)}")
+
+
+@app.get("/api/notion/recent")
+async def get_recent_notion_scores(limit: int = 10):
+    """
+    Get recent scores from Notion database.
+
+    - limit: Maximum number of scores to return (default 10)
+    """
+    try:
+        notion = get_notion_integration()
+        scores = notion.get_recent_scores(limit=limit)
+        return {
+            "success": True,
+            "count": len(scores),
+            "scores": scores
+        }
+    except Exception as e:
+        logger.exception(f"Error fetching Notion scores: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch scores: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn
