@@ -29,7 +29,7 @@ class BubbleDetectorConfig:
     max_aspect_ratio: float = 2.5
 
     # Minimum contour area to filter noise
-    min_contour_area: int = 20
+    min_contour_area: int = 10
 
     # Distance threshold for deduplication (pixels)
     dedup_distance: float = 5.0
@@ -41,7 +41,7 @@ class BubbleDetectorConfig:
     row_threshold: int = 15
 
     # Marking detection threshold (0-1, higher = darker)
-    marking_threshold: float = 0.35
+    marking_threshold: float = 0.25
 
 
 class BubbleDetector:
@@ -98,7 +98,7 @@ class BubbleDetector:
         """
         gray = self._get_grayscale(warped_image)
         _, thresh = cv2.threshold(
-            gray, self.config.binary_threshold, 255, cv2.THRESH_BINARY_INV
+            gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
         )
 
         # Morphological opening to remove thin grid lines

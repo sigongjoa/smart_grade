@@ -25,30 +25,30 @@ class GridDetectorConfig:
     """Configuration for grid-based OMR detection."""
 
     # Minimum area ratio for a valid OMR card (relative to image)
-    min_card_area_ratio: float = 0.02
+    min_card_area_ratio: float = 0.001
 
     # Maximum area ratio for a valid OMR card
     max_card_area_ratio: float = 0.5
 
     # Aspect ratio range for OMR cards (width/height)
-    min_aspect_ratio: float = 0.4
-    max_aspect_ratio: float = 2.5
+    min_aspect_ratio: float = 0.3
+    max_aspect_ratio: float = 4.0
 
     # Padding around detected cards (pixels)
-    card_padding: int = 10
+    card_padding: int = 20
 
-    # Minimum contour area to consider
-    min_contour_area: int = 10000
+    # Minimum contour area to consider (on resized 1000px image)
+    min_contour_area: int = 500
 
     # Canny edge detection thresholds
-    canny_low: int = 30
+    canny_low: int = 20
     canny_high: int = 150
 
     # Morphological kernel size
-    morph_kernel_size: Tuple[int, int] = (5, 5)
+    morph_kernel_size: Tuple[int, int] = (3, 3)
 
     # Grid sorting tolerance (percentage of card height)
-    row_tolerance: float = 0.3
+    row_tolerance: float = 0.5
 
 
 @dataclass
@@ -140,11 +140,15 @@ class OMRGridDetector:
         Returns:
             List of bounding boxes (x, y, w, h).
         """
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        img_area = image.shape[0] * image.shape[1]
-
-        # Apply adaptive thresholding
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        # Resize for faster processing
+        target_height = 1000
+        ratio = target_height / image.shape[0]
+        small_gray = cv2.resize(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), (int(image.shape[1] * ratio), target_height), interpolation=cv2.INTER_AREA)
+        
+        img_area = small_gray.shape[0] * small_gray.shape[1]
+        
+        # Apply blurring
+        blurred = cv2.GaussianBlur(small_gray, (5, 5), 0)
 
         # Edge detection
         edges = cv2.Canny(
@@ -195,8 +199,16 @@ class OMRGridDetector:
             # If we get a quadrilateral, use it
             if len(approx) == 4:
                 x, y, w, h = cv2.boundingRect(approx)
+            else:
+                x, y, w, h = cv2.boundingRect(contour)
 
-            bboxes.append((x, y, w, h))
+            # Rescale back to original size
+            bboxes.append((
+                int(x / ratio),
+                int(y / ratio),
+                int(w / ratio),
+                int(h / ratio)
+            ))
 
         # Remove overlapping boxes (keep larger ones)
         bboxes = self._remove_overlapping(bboxes)

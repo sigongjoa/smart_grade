@@ -1,0 +1,16 @@
+{
+  "name": "node13_smart_grader",
+  "version": "1.0.0",
+  "description": "AI-based automatic grading system with flexible OMR recognition and LLM-powered analytics.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@playwright/test": "^1.58.1",
+    "playwright": "^1.58.1"
+  }
+}
