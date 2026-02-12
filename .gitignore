@@ -34,4 +34,22 @@ backend/backend.log
 frontend/frontend.log
 .DS_Store
 .env
-.env
+
+# Sensitive/Large Files
+*.jpg
+*.jpeg
+*.png
+*.pdf
+*.json
+!package.json
+!package-lock.json
+debug_*.jpg
+diagnose_*.jpg
+viz_*.jpg
+scan_*.jpg
+thresh_*.jpg
+backend/uploads/
+backend/all_bubbles_*.jpg
+backend/diagnose_*.jpg
+backend/debug_*.jpg
+test_results/
